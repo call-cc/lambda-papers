@@ -1,0 +1,1082 @@
+= Scheme: An interpreter for extended lambda calculus
+:lang: en
+
+== Scheme: An interpreter for extended lambda calculus
+
+=== Abstract
+
+Inspired by ACTORS [Greif and Hewitt] [Smith and Hewitt], we have
+implemented an interpreter for a LISP-like language, SCHEME, based on
+the lambda calculus [Church], but extended for side effects,
+multiprocessing, and process synchronization. The purpose of this
+implementation is tutorial. We wish to:
+
+. alleviate the confusion caused by Micro-PLANNER, CONNIVER, etc. by
+clarifying the embedding of non-recursive control structures in a
+recursive host language like LISP.
+. explain how to use these control structures, independent of such
+issues as pattern matching and data base manipulation.
+. have a simple concrete experimental domain for certain issues of
+programming semantics and style.
+
+This paper is organized into sections. The first section is a short
+"reference manual" containing specifications for all the unusual
+features of SCHEME. Next, we present a sequence of programming examples
+which illustrate various programming styles, and how to use them. This
+will raise certain issues of semantics which we will try to clarify with
+lambda calculus in the third section. In the fourth section we will give
+a general discussion of the issues facing an implementor of an
+interpreter for a language based on lambda calculus. Finally, we present
+a completely annotated interpreter for SCHEME, written in MacLISP
+[Moon], to acquaint programmers with the tricks of the trade of
+implementing non-recursive control structures in a recursive language
+like LISP.
+
+This report describes research done at the Artificial Intelligence
+Laboratory of the Massachusetts Institute of Technology. Support for the
+laboratory's artificial intelligence research is provided in part by the
+Advanced Research Projects Agency of the Department of Defense under
+Office of Naval Research contract N00014-75-C-0643.
+
+=== Section 1: The SCHEME Reference Manual
+
+SCHEME is essentially a full-funarg LISP. `LAMBDA` expressions need not
+be `QUOTE`d, `FUNCTION`ed, or `*FUNCTION`ed when passed as arguments or
+returned as values; they will evaluate to closures of themselves.
+
+All LISP functions (i.e., `EXPR`s, `SUBR`s, and `LSUBR`s, but _not_
+`FEXPR`s, `FSUBR`s, or `MACRO`s) are primitive operators in SCHEME, and
+have the same meaning as they have in LISP. Like `LAMBDA` expressions,
+primitive operators and numbers are self-evaluating (they evaluate to
+trivial closures of themselves).
+
+There are a number of special primitives known as `AINT`s which are to
+SCHEME as `FSUBR`s are to LISP. We will enumerate them here.
+
+==== `IF`
+
+This is the primitive conditional operator. It takes three arguments. If
+the first evaluates to non-`NIL`, it evaluates the second expression,
+and otherwise the third.
+
+==== `QUOTE`
+
+As in LISP, this quotes the argument form so that it will be passed
+verbatim as data. The abbreviation "`'FOO`" may be used instead of
+"`(QUOTE FOO)`".
+
+==== `DEFINE`
+
+This is analogous to the MacLISP `DEFUN` primitive (but note that the
+`LAMBDA` must appear explicitly!). It is used for defining a function in
+the "global environment" permanently, as opposed to `LABELS` (see
+below), which is used for temporary definitions in a local environment.
+`DEFINE` takes a name and a lambda expression; it closes the lambda
+expression in the global environment and stores the closure in the LISP
+value cell of the name (which is a LISP atom).
+
+==== `LABELS`
+
+We have decided not to use the traditional `LABEL` primitive in this
+interpreter because it is difficult to define several mutually recursive
+functions using only `LABEL`. The solution, which Hewitt [Smith and
+Hewitt] also uses, is to adopt an ALGOLesque block syntax:
+
+....
+    (LABELS <function definition list> <expression>)
+....
+
+This has the effect of evaluating the expression in an environment where
+all the functions are defined as specified by the definition list.
+Furthermore, the functions are themselves closed in that environment,
+and not in the outer environment; this allows the functions to call
+themselves _and each other_ recursively. For example, consider a
+function which counts all the atoms in a list structure recursively to
+all levels, but which doesn't count the `NIL`s which terminate the lists
+(but `NIL`s in the `CAR` of some list count). In order to perform this
+we use two mutually recursive functions, one to count the car and one to
+count the cdr, as follows:
+
+....
+    (DEFINE COUNT
+        (LAMBDA (L)
+            (LABELS ((COUNTCAR
+                      (LAMBDA (L)
+                          (IF (ATOM L) 1
+                              (+ (COUNTCAR (CAR L))
+                                 (COUNTCAR (CDR L))))))
+                     (COUNTCDR
+                      (LAMBDA (L)
+                          (IF (ATOM L)
+                              (IF (NULL L) 0 1)
+                              (+ (COUNTCAR (CAR L))
+                                 (COUNTCDR (CDR L)))))))
+               (COUNTCDR L))))             ; Note: COUNTCDR is defined here.
+....
+
+==== `ASET`
+
+This is the side effect primitive. It is analogous to the LISP function
+`SET`. For example, to define a _cell_ [Smith and Hewitt], we may use
+`ASET` as follows:
+
+....
+    (DEFINE CONS-CELL
+        (LAMBDA (CONTENTS)
+            (LABELS ((THE-CELL
+                      (LAMBDA (MSG)
+                          (IF (EQ MSG 'CONTENTS?) CONTENTS
+                              (IF (EQ MSG 'CELL?) 'YES
+                                  (IF (EQ (CAR MSG) '<-)
+                                      (BLOCK (ASET 'CONTENTS (CADR MSG))
+                                             THE-CELL)
+                                      (ERROR '|UNRECOGNIZED MESSAGE - CELL|
+                                              MSG
+                                           'WRNG-TYPE-ARG)))))))
+                   THE-CELL)))
+....
+
+Those of you who may complain about the lack of `ASETQ` are invited to
+write `(ASET' foo bar)` instead of `(ASET 'foo bar)`
+
+==== `EVALUATE`
+
+This is similar to the LISP function `EVAL`. It evaluates its argument,
+and then evaluates the resulting s-expression as SCHEME code.
+
+==== `CATCH`
+
+This is the "escape operator" which gives the user a handle on the
+control structure of the interpreter. The expression:
+
+....
+    (CATCH <identifier> <expression>)
+....
+
+evaluates `<expression>` in an environment where `<identifier>` is bound
+to a continuation which is "just about to return from the `CATCH`"; that
+is, if the continuation is called as a function of one argument, then
+control proceeds as if the `CATCH` expression had returned with the
+supplied (evaluated) argument as its value. For example, consider the
+following obscure definition of `SQRT` (Sussman's favorite
+style/Steele's least favorite):
+
+....
+    (DEFINE SQRT
+        (LAMBDA (X EPSILON)
+            ((LAMBDA (ANS LOOPTAG)
+                 (CATCH RETURNTAG
+                        (PROGN
+                         (ASET 'LOOPTAG (CATCH M M))        ;CREATE PROG TAG
+                         (IF (< (ABS (-$ (*$ ANS ANS) X)) EPSILON)
+                             (RETURNTAG ANS)                ;RETURN
+                             NIL)                           ;JFCL
+                         (ASET 'ANS (//$ (+$ (//$ X ANS) ANS) 2.0))
+                         (LOOPTAG LOOPTAG))))               ;GOTO
+             1.0
+             NIL)))
+....
+
+Anyone who doesn't understand how this manages to work probably should
+not attempt to use `CATCH`.
+
+As another example, we can define a `THROW` function, which may then be
+used with `CATCH` much as they are in LISP:
+
+....
+    (DEFINE THROW (LAMBDA (TAG RESULT) (TAG RESULT)))
+....
+
+==== `CREATE!PROCESS`
+
+This is the process generator for multiprocessing. It takes one
+argument, an expression to be evaluated in the current environment as a
+separate parallel process. If the expression ever returns a value, the
+process automatically terminates. The value of `CREATE!PROCESS` is a
+process id for the newly generated process. Note that the newly created
+process will not actually run until it is explicitly started.
+
+==== `START!PROCESS`
+
+This takes one argument, a process id, and starts up that process. It
+then runs.
+
+==== `STOP!PROCESS`
+
+This also takes a process id, but stops the process. The stopped process
+may be continued from where it was stopped by using `START!PROCESS`
+again on it. The magic global variable `**PROCESS**` always contains the
+process id of the currently running process; thus a process can stop
+itself by doing `(STOP!PROCESS **PROCESS**)`. A stopped process is
+garbage collected if no live process has a pointer to its process id.
+
+==== `EVALUATE!UNINTERRUPTIBLY`
+
+This is the synchronization primitive. It evaluates an expression
+uninterruptibly; i.e. no other process may run until the expression has
+returned a value. Note that if a funarg is returned from the scope of an
+`EVALUATE!UNINTERRUPTIBLY`, then that funarg will be uninterruptible
+when it is applied; that is, the uninterruptibility property follow the
+rules of variable scoping. For example, consider the following function:
+
+....
+    (DEFINE SEMGEN
+        (LAMBDA (SEMVAL)
+            (LIST (LAMBDA ()
+                      (EVALUATE!UNINTERRUPTIBLY
+                          (ASET' SEMVAL (+ SEMVAL 1))))
+                  (LABELS (P (LAMBDA ()
+                                 (EVALUATE!UNINTERRUPTIBLY
+                                     (IF (PLUSP SEMVAL)
+                                         (ASET' SEMVAL (- SEMVAL 1))
+                                         (P)))))
+                         P))))
+....
+
+This returns a pair of functions which are V and P operations on a newly
+created semaphore. The argument to `SEMGEN` is the initial value for the
+semaphore. Note that P busy-waits by iterating if necessary; because
+`EVALUATE!UNINTERRUPTIBLY` uses variable-scoping rules, other processes
+have a chance to get in at the beginning of each iteration. This
+busy-wait can be made much more efficient by replacing the expression
+`(P)` in the definition of `P` with
+
+....
+    ((LAMBDA (ME)
+             (BLOCK (START!PROCESS (CREATE!PROCESS '(START!PROCESS ME)))
+                    (STOP!PROCESS ME)
+                    (P)))
+     **PROCESS**)
+....
+
+Let's see you figure this one out! Note that a `STOP!PROCESS` within an
+`EVALUATE!UNINTERRUPTIBLY` forces the process to be swapped out even if
+it is the current one, and so other processes get to run; but as soon as
+it gets swapped in again, others are locked out as before.
+
+Besides the `AINT`s, SCHEME has class of primitives known as `AMACRO`s.
+These are similar to MacLISP `MACRO`s, in that they are expanded into
+equivalent code before being executed. Some `AMACRO`s supplied with the
+SCHEME interpreter:
+
+==== `COND`
+
+This is like the MacLISP `COND` statement, except that singleton clauses
+(where the result of the predicate is the returned value) are not
+allowed.
+
+==== `AND`, `OR`
+
+These are also as in MacLISP.
+
+==== `BLOCK`
+
+This is like the MacLISP `PROGN`, but arranges to evaluate its last
+argument without an extra net control frame (explained later), so that
+the last argument may involved in an iteration. Note that in SCHEME,
+unlike MacLISP, the body of a `LAMBDA` expression is _not_ an implicit
+`PROGN`.
+
+==== `DO`
+
+This is like that MacLISP "new-style" `DO`; old-style `DO` is not
+supported.
+
+==== `AMAPCAR`, `AMAPLIST`
+
+These are like `MAPCAR` and `MAPLIST`, but they expect a SCHEME lambda
+closure for the first argument.
+
+To use SCHEME, simply incant at DDT (MIT-AI):
+
+....
+    :LISP LIBLSP;SCHEME
+....
+
+which will load up the current version of SCHEME, which will announce
+itself and give a prompt. If you want to escape to LISP, merely hit
+`^G`. To restart SCHEME, type `(SCHEME)`. Sometimes one does need to use
+a LISP `FSUBR` such as `UREAD`; this may be accomplished by typing, for
+example,
+
+....
+    (EVAL' (UREAD FOO BAR DSK LOSER))
+....
+
+After doing this, typing `^Q` will, of course, cause SCHEME to read from
+the file.
+
+This concludes the SCHEME Reference Manual.
+
+=== Section 2: Some SCHEME Programming Examples
+
+==== Traditional Recursion
+
+Here is the good old familiar recursive definition of factorial, written
+in SCHEME.
+
+....
+    (DEFINE FACT
+       (LAMBDA (N) (IF (= N 0) 1
+                       (* N (FACT (- N 1))))))
+....
+
+==== What About Iteration?
+
+There are many other ways to compute factorial. One important way is
+through the use of _iteration_. Consider the following definition of
+`FACT`. Although it appears to be recursive, since it "calls itself", it
+captures the essence of our intuitive notion of iteration, because
+execution of this program will not produce internal structures (e.g.
+stacks or variable bindings) which increase in size with the number of
+iteration steps. This surprising fact will be explained in two ways.
+
+. We will consider programming styles in terms of substitution semantics
+of the lambda calculus (Section 3).
+. We will show how the SCHEME interpreter is implemented (Sections 4,5).
+
+....
+    (DEFINE FACT
+       (LAMBDA (N)
+           (LABELS ((FACT1 (LAMBDA (M ANS)
+                               (IF (= M 0) ANS
+                                       (FACT1 (- M 1)
+                                              (* M ANS))))))
+                    (FACT1 N))))
+....
+
+A common iterative construct is the `DO` loop. The most general form we
+have seen in any programming language is the MacLISP `DO` [Moon]. It
+permits the simultaneous initialization of any number of control
+variables and the simultaneous stepping of these variables by arbitrary
+functions at each iteration step. The loop is terminated by an arbitrary
+predicate, and an arbitrary value may be returned. The `DO` loop may
+have a body, a series of expressions executed for effect on each
+iteration.
+
+The general form of a MacLISP `DO` is:
+
+....
+    (DO ((<var1> <init1> <step1>)
+         (<var2> <init2> <step2>)
+         . . .
+         (<varn> <initn> <stepn>))
+        (<pred> <value>)
+        <body>)
+....
+
+The semantics of this are that the variables are bound and initialized
+to the values of the <initi> expressions, which must all be evaluated in
+the environment outside the `DO`; then the predicate <pred> is evaluated
+in the new environment, and if `TRUE`, the <value> is evaluated and
+returned. Otherwise the body is evaluated, then each of the steppers
+<stepi> is evaluated in the current environment, all the variables made
+to have the results as their values, and the predicate evaluated again,
+and so on.
+
+For example, the following MacLISP function:
+
+....
+    (DEFUN REV (L)
+           (DO ((L1 L (CDR L1))
+                (ANS NIL (CONS (CAR L1) ANS)))
+               ((NULL L1) ANS)))
+....
+
+computes the reverse of a list. In SCHEME, we could write the same
+function, in the same iterative style, as follows:
+
+....
+    (DEFINE REV
+        (LAMBDA (L)
+            (LABELS ((DOLOOP (LAMBDA (L1 ANS)
+                                 (IF (NULL L1) ANS
+                                     (DOLOOP (CDR L1)
+                                             (CONS (CAR L1) ANS))))))
+                    (DOLOOP L NIL))))
+....
+
+From this we can infer a general way to express iterations in SCHEME in
+a manner isomorphic to the MacLISP `DO`:
+
+....
+    (LABELS ((DOLOOP
+              (LAMBDA (<dummy> <var1> <var2> ... <varn>)
+                  (IF <pred> <value>
+                      (DOLOOP <body> <step1> <step2> ... <stepn>)))))
+            (DOLOOP NIL <init1> <init2> ... <initn>))
+....
+
+This is in fact what the supplied `DO` `AMACRO` expands into. Note that
+there are no side effects in the steppings of the iteration variables.
+
+==== Another Way To Do Recursion
+
+Now consider the following alternative definition of `FACT`. It has an
+extra argument, the _continuation_ [Reynolds], which is a function to
+call with the answer, when we have it, rather than return a value; that
+is, rather than ultimately reducing to the desired value, it reduces to
+a combination which is the application of the continuation to the
+desired value.
+
+....
+    (DEFINE FACT
+        (LAMBDA (N C)
+           (IF (= N 0) (C 1)
+               (FACT (- N 1)
+                     (LAMBDA (A) (C (* N A)))))))
+....
+
+Note that we can call this like an ordinary function if we supply
+`(LAMBDA (X) X)` as the second argument. For example,
+`(FACT 3 (LAMBDA (X) X))` returns 6.
+
+==== Apparently "Hairy" Control Structure
+
+A classic problem difficult to solve in most programming languages,
+including standard (stack-oriented) LISP, is the _samefringe_ problem
+[Smith and Hewitt]. The problem is to determine whether the fringes of
+two trees are the same, even if the internal structures of the trees are
+not. This problem is easy to solve if one merely computes the fringe of
+each tree separately as a list, and then compares the two lists. We
+would like to solve the problem so that the fringes are generated and
+compared incrementally. This is important if the fringes of the trees
+are very large, but differ, say, in the first position.
+
+Consider the following obscure solution to _samefringe_, which is in
+fact isomorphic to the one written by Shrobe and presented by Smith and
+Hewitt. Note that SCHEME does not have the packagers of PLASMA, and so
+we were forced to use continuations; rather than using packages and a
+_next_ operator, we pass a fringe a continuation (called a "getter")
+which will get the next and the rest of the fringe as its two arguments.
+
+....
+    (DEFINE FRINGE
+       (LAMBDA (TREE)
+           (LABELS ((FRINGEN
+                     (LAMBDA (NODE ALT)
+                         (LAMBDA (GETTER)
+                             (IF (ATOM NODE)
+                                 (GETTER NODE ALT)
+                                 ((FRINGEN (CAR NODE)
+                                           (LAMBDA (GETTER1)
+                                               ((FRINGEN (CDR NODE)
+                                                         ALT)
+                                                GETTER1)))
+                                   GETTER))))))
+                    (FRINGEN TREE
+                             (LAMBDA (GETTER)
+                                 (GETTER '(EXHAUSTED) NIL))))))
+
+    (DEFINE SAMEFRINGE
+       (LAMBDA (TREE1 TREE2)
+           (LABELS ((SAME
+                     (LAMBDA (S1 S2)
+                         (S1 (LAMBDA (X1 R1)
+                                 (S2 (LAMBDA (X2 R2)
+                                         (IF (EQUAL X1 X2)
+                                             (IF (EQUAL X1 '(EXHAUSTED))
+                                                 T
+                                                 (SAME R1 R2))
+                                            NIL))))))))
+                   (SAME (FRINGE TREE1)
+                         (FRINGE TREE2)))))
+....
+
+Now let us consider an alternative solution to the _samefringe_ problem.
+We believe that this solution is clearer for two reasons:
+
+. the implementation of `SAMEFRINGE` is more clearly iterative;
+. rather than returning an object which will return both the _first_ and
+the _rest_ of a fringe to a given continuation, `FRINGE` returns an
+object which will deliver up a component in response to a request for
+that component.
+
+``
+
+....
+    (DEFINE FRINGE
+        (LAMBDA (TREE)
+            (LABELS ((FRINGE1
+                      (LAMBDA (NODE ALT)
+                         (IF (ATOM NODE)
+                             (LAMBDA (MSG)
+                                 (IF (EQ MSG 'FIRST) NODE
+                                     (IF (EQ MSG 'NEXT) (ALT) (ERROR))))
+                             (FRINGE1 (CAR NODE)
+                                      (LAMBDA () (FRINGE1 (CDR NODE) ALT)))))))
+                    (FRINGE1 TREE
+                             (LAMBDA ()
+                                 (LAMBDA (MSG) (IF (EQ MSG 'FIRST) '*EOF* (ERROR))))))))
+
+    (DEFINE SAMEFRINGE
+        (LAMBDA (T1 T2)
+            (DO ((C1 (FRINGE T1) (C1 'NEXT))
+                 (C2 (FRINGE T2) (C2 'NEXT)))
+                ((OR (NOT (EQ (C1 'FIRST) (C2 'FIRST)))
+                     (EQ (C1 'FIRST) '*EOF*)
+                     (EQ (C2 'FIRST) '*EOF*))
+                 (EQ (C1 'FIRST) (C2 'FIRST))))))
+....
+
+A much simpler and more probable problem is that of building a pattern
+matcher with backtracking for segment matches. The matcher presented
+below is intended for matching single-level list structure patterns
+against lists of atoms. A pattern is a list containing three types of
+elements:
+
+. constant atoms, which match themselves only.
+. `(TVH x)`, which matches any single element in the expression
+consistently. We may abbreviate this as ?x by means of a LISP reader
+macro character.
+. `(TVH* x)`, which matches any segment of zero or more elements in the
+expression consistently. We may abbreviate this as !x.
+
+The matcher returns either `NIL`, meaning no match is possible, or a
+list of two items, an alist specifying the bindings of the match
+variables, and a continuation to call, if you don't like this particular
+set of bindings, which will attempt to find another match. Thus, for
+example, the invocation
+
+....
+    (MATCH '(A !B ?C ?C !B !E)
+           '(A X Y Q Q X Y Z Z X Y Q Q X Y R))
+....
+
+would return the result
+
+....
+    (((E (Z Z X Y Q Q X Y R))
+      (C Q)
+      (B X Y))
+     <continuation1>)
+....
+
+where calling `<continuation1>` as a function of no arguments would
+produce the result
+
+....
+    (((E (R))
+      (C Z)
+      (B (X Y Q Q X Y)))
+      <continuation2>)
+....
+
+where calling `<continuation2>` would produce `NIL`.
+
+The `MATCH` function makes use of two auxiliary functions called
+`NFIRST` and `NREST`. The former returns the list of the first n
+elements of a given list, while the latter returns the tail of the given
+list after the first n elements.
+
+....
+    (define nfirst
+       (lambda (e n)
+           (if (= n 0) nil
+               (cons (car e) (nfirst (cdr e) (- n 1))))))
+
+    (define nrest
+       (lambda (e n)
+           (if (= n 0) e
+               (nrest (cdr e) (- n 1)))))
+....
+
+The main `MATCH` function also uses a subfunction called `MATCH1` which
+takes four arguments; the tail of the pattern yet to be matched; the
+tail of the expression yet to be matched; the alist of match bindings
+made so far; and a continuation to call if the match fails at this
+point. A subfunction of `MATCH`, called `MATCH*`, handles the matching
+of segments of the expression against `TVH*` match variables. It is in
+the matching segments that the potential need for backtracking enters,
+for segments of various lengths may have to be tried. After `MATCH*`
+matches a segment, it calls `MATCH1` to continue the match, giving it a
+failure continuation which will back up and try to match a longer
+segment if possible. A failure can occur if a constant fails a match, or
+if one or the other of pattern and expression runs out before the other
+one does.
+
+....
+    (DEFINE MATCH
+       (LAMBDA (PATTERN EXPRESSION)
+           (LABELS ((MATCH1
+               (LAMBDA (P E ALIST LOSE)
+                   (IF (NULL P) (IF (NULL E) (LIST ALIST LOSE) (LOSE))
+                       (IF (ATOM (CAR P))
+                           (IF (NULL E) (LOSE)
+                               (IF (EQ (CAR E) (CAR P))
+                                   (MATCH1 (CDR P) (CDR E) ALIST LOSE)
+                                   (LOSE)))
+                           (IF (EQ (CAAR P) 'THV)
+                               (IF (NULL E) (LOSE)
+                                   ((LAMBDA (V)
+                                        (IF V (IF (EQ (CAR E) (CADR V))
+                                                  (MATCH1 (CDR P) (CDR E) ALIST LOSE)
+                                                  (LOSE))
+                                            (MATCH1 (CDR P) (CDR E)
+                                                    (CONS (LIST (CADAR P) (CAR E)) ALIST)
+                                                    LOSE)))
+                                    (ASSQ (CADAR P) ALIST)))
+                           (IF (EQ (CAAR P) 'THV*)
+                               ((LAMBDA (V)
+                                    (IF V
+                                        (IF (< (LENGTH E) (LENGTH (CADR V))) (LOSE)
+                                            (IF (EQUAL (NFIRST E (LENGTH (CADR V)))
+                                                       (CADR V))
+                                                (MATCH1 (CDR P)
+                                                        (NREST E (LENGTH (CADR V)))
+                                                        ALIST
+                                                        LOSE)
+                                                (LOSE)))
+                                        (LABELS ((MATCH*
+                                            (LAMBDA (N)
+                                                (IF (> N (LENGTH E)) (LOSE)
+                                                    (MATCH1 (CDR P) (NREST E N)
+                                                            (CONS (LIST (CADAR P)
+                                                                        (NFIRST E N))
+                                                                  ALIST)
+                                                            (LAMBDA ()
+                                                                (MATCH* (+ N 1))))))))
+                                                (MATCH* 0))))
+                               (ASSQ (CADAR P) ALIST))
+                             (LOSE))))))))
+             (MATCH1 PATTERN
+                     EXPRESSION
+                     NIL
+                     (LAMBDA () NIL)))))
+....
+
+==== A Useless Multiprocessing Example
+
+One thing we might want to use multiprocessing for is to try two things
+in parallel, and terminate as soon as one succeeds. We can do this with
+the following function.
+
+....
+    (DEFINE TRY!TWO!THINGS!IN!PARALLEL
+       (LAMBDA (F1 F2)
+          (CATCH C
+             ((LAMBDA (P1 P2)
+                 ((LAMBDA (F1 F2)
+                      (EVALUATE!UNINTERRUPTIBLY
+                       (BLOCK (ASET 'P1 (CREATE!PROCESS '(F1)))
+                              (ASET 'P2 (CREATE!PROCESS '(F2)))
+                              (START!PROCESS P1)
+                              (START!PROCESS P2)
+                              (STOP!PROCESS **PROCESS**))))
+                  (LAMBDA ()
+                     ((LAMBDA (VALUE)
+                         (EVALUATE!UNINTERRUPTIBLY
+                          (BLOCK (STOP!PROCESS P2) (C VALUE))))
+                      (F1)))
+                  (LAMBDA ()
+                     ((LAMBDA (VALUE)
+                         (EVALUATE!UNINTERRUPTIBLY
+                          (BLOCK (STOP!PROCESS P1) (C VALUE))))
+                      (F2)))))
+          NIL NIL))))
+....
+
+`TRY!TWO!THINGS!IN!PARALLEL` takes two functions of no arguments (in
+order to pass an unevaluated expression and its environment in for later
+use, so as to avoid variable conflicts). It creates two processes to run
+them, and returns the value of whichever completes first.
+
+As an example of how to misuse `TRY!TWO!THINGS!IN!PARALLEL`, here is a
+function which determines the sign of an integer using only `ADD1`,
+`SUB1`, and `EQUAL`.
+
+....
+    (DEFINE SIGN
+        (LAMBDA (N)
+            (IF (EQUAL N 0) 'ZERO
+                (TRY!TWO!THINGS!IN!PARALLEL
+                    (LAMBDA ()
+                        (DO ((I 0 (ADD1 I)))
+                            ((EQUAL I N) 'POSITIVE)))
+                    (LAMBDA ()
+                        (DO ((I 0 (SUB1 I)))
+                            ((EQUAL I N) 'NEGATIVE)))))))
+....
+
+=== Section 3: Substitution Semantics and Programming Styles
+
+In the previous section we showed several different SCHEME programs for
+computing the factorial function. How are they different? We intuitively
+distinguish recursive from iterative programs, for example, by noting
+that recursive programs "call themselves" but in the last section we
+claimed to do iteration with a seemingly recursive program. Experienced
+programmers "know" that recursion uses up "stack" so a program
+implemented recursively will run out of stack on a sufficiently large
+problem. Can we make these ideas more precise? One traditional approach
+is to model the computation with lambda calculus.
+
+==== Reviewing the Lambda Calculus
+
+Traditionally language constructs are broken up into two distinct
+classes: imperative constructs and those with side-effects — such as
+assignment and go-to; and applicative construct — those executed for
+value — such as arithmetic expressions. In addition, compiled languages
+often require a third class, declarative constructs, but these are
+provided primarily to guide the compilation process and do not directly
+affect the semantics of execution, and so will not concern use here.
+
+Lambda calculus is a model for the applicative component of programming
+languages. It models all non-imperative constructs as applications of
+functions and specifies the semantics of such expressions by a set of
+axioms of rewrite rules. One axiom states that a combination, i.e. an
+expression formed by a function with the appropriate arguments
+substituted for the free occurences of the formal parameters of the
+functions in its body:
+
+....
+    ((LAMBDA <vars> <body>) <args>) = Subst[<args> <vars> <body>]
+....
+
+Another axiom requires that the meaning of an expression be independent
+of the names of the formal parameters bound in the expression:
+
+....
+    (LAMBDA <vars> <body>)
+            = (LAMBDA <newvars> Subst[<newvars> <vars> <body>])
+    provided that none of <newvars> appears free in <body>.
+....
+
+These constraints force Subst to be defined in such a way that an
+important kind of _referential transparency_ is obtained. Besides these
+"structural" axioms, other are provided which specify the result of
+certain primitive functions applied to specific arguments. We shall not
+be concerned with these problems here — we will assume a small
+reasonable set of primitive functions.
+
+==== Recursive Programs
+
+Now let's see how lambda calculus may be used (informally) to model a
+computation. Consider the standard definition of the factorial function:
+
+....
+    (DEFINE FACT
+       (LAMBDA (N) (IF (= N 0) 1
+                       (* N (FACT (- N 1))))))
+....
+
+We are being _very_ informal — lambda calculus as presented by [Church]
+does not include such constructs as `DEFINE`, `IF`, or `=`, `*`, or even
+`1`! The "usual" lambda calculus construct for defining recursive
+functions is a rather obscure object called the "fixed-point" operator.
+We have been lax to avoid the hassle of "rigor mortis" in this tutorial
+paper. Similarly, `IF` is the SCHEME conditional construct we will use
+for convenience, it reduces to its second or third argument depending on
+whether the first reduces to `TRUE` or `FALSE`. The objects `*`, `=`,
+`0`, `1`, etc. may be thought of as abbreviations for complex lambda
+expressions (such as Church numerals) whose details we are not
+interested in. On the other hand, we may think of them as primitive
+expressions, defined by additional axioms; this viewpoint leads to
+practical interpreter implementations.
+
+Now let's reduce the expression `(FACT 3)`. We will perform the
+expression reductions, except for the `IF` primitive, in Applicative
+Order (call by value), though this is not necessary, as we will discuss
+later. We display a "trace" of the substitutions:
+
+....
+    =>   (FACT 3)
+    =>   (IF (= 3 0) 1 (* 3 (FACT (- 3 1))))
+    =>   (* 3 (FACT (- 3 1)))
+    =>   (* 3 (FACT 2))
+    =>   (* 3 (IF (= 2 0) 1 (* 2 (FACT (- 2 1)))))
+    =>   (* 3 (* 2 (FACT (- 2 1))))
+    =>   (* 3 (* 2 (FACT 1)))
+    =>   (* 3 (* 2 (IF (= 1 0) 1 (* 1 (FACT (- 1 1))))))
+    =>   (* 3 (* 2 (* 1 (FACT (- 1 1)))))
+    =>   (* 3 (* 2 (* 1 (FACT 0))))
+    =>   (* 3 (* 2 (* 1 (IF (= 0 0) 1 (* 0 (FACT (- 0 1)))))))
+    =>   (* 3 (* 2 (* 1 1)))
+    =>   (* 3 (* 2 1))
+    =>   (* 3 2)
+    =>   6
+....
+
+You will note that we have calculated `(FACT 3)` by a process wherein
+_each expression is replaced_ by an expression which is provably
+equivalent to it via an axiom of which is produced by application of a
+primitive function.
+
+==== Now, What About Iteration?
+
+Consider the "iterative" definition of `FACT`. Altough it appears to be
+recursive, since it "calls itself", we will see that it captures the
+essence of our notion of iteration.
+
+....
+    (DEFINE FACT
+       (LAMBDA (N)
+           (LABELS ((FACT1
+                     (LAMBDA (M ANS)
+                         (IF (= M 0) ANS
+                             (FACT1 (- M 1) (* M ANS))))))
+                (FACT1 N))))
+....
+
+Let us now compute `(FACT 3)`.
+
+....
+    =>   (FACT 3)
+    =>   (FACT 1 3 1)
+    =>   (IF (= 3 0) 1
+             (FACT1 (- 3 1) (* 3 1)))
+    =>   (FACT1 (- 3 1) (* 3 1))
+    =>   (FACT1 2 (* 3 1))
+    =>   (FACT1 2 3)
+    =>   (IF (= 2 0) 3
+             (FACT1 (- 2 1) (* 2 3)))
+    =>   (FACT1 (- 2 1) (* 2 3))
+    =>   (FACT1 1 (* 2 3))
+    =>   (FACT1 1 6)
+    =>   (IF (= 1 0) 6
+             (FACT1 (- 1 1) (* 1 6)))
+    =>   (FACT1 (- 1 1) (* 1 6))
+    =>   (FACT1 0 (* 1 6))
+    =>   (FACT1 0 6)
+    =>   (IF (= 0 0) 6
+             (FACT1 (- 0 1) (* 0 6)))
+    =>   6
+....
+
+Notice that the expression involved have a fixed maximum size
+independent of the argument to `FACT`! In fact, as Marvin Minsky pointed
+out, successive reductions produce a cycle of expressions which are
+identical except for the numerical quantities involved. Looking back, we
+may note by the way of comparison that the recursive version caused
+creation of expressions proportional in size to the argument. This is
+why we think that this version of `FACT` is iterative rather than
+recursive. At each stage of the iterative version the "state" of the
+computation is summarized in two variables, the counter and the answer
+accumulator, while at each stage of the recursive version the "state"
+contains a chain of pieces each of which contains a component of the
+state. In the recursive version of `FACT`, for example, the state
+contains the sequence of multiplications to be performed upon return
+from the bottom. It is true that the iterative factorial also can
+produce expressions of arbitrary size, since the number of bits needed
+to express factorial of n grows with n; but this is a property of the
+numbers calculated by the function which is implemented in iterative
+style, and not of the iterative control structure itself. A recursive
+control structure _inherently_ creates expressions of unbounded size as
+a function of the recursion depth, while an iterative control structure
+produces a cycle of equivalent expressions, and so the expressions are
+of approximately the same size no matter how many iteration steps are
+taken. This is the essence of the difference between notions of
+iteration and recursion. Hewitt [MAC, p. 234] made similar observation
+in passing, expressing the difference in term of storage used in program
+execution rather than in terms of intermediate expressions produced by
+substitution semantics.
+
+==== Continuation Passing Recursion
+
+Remember the other way to compute factorials?
+
+....
+    (DEFINE FACT
+       (LAMBDA (N C)
+          (IF (= N 0) (C 1)
+              (FACT (- N 1)
+                    (LAMBDA (A) (C (* N A)))))))
+....
+
+This looks iterative on the surface! but in fact it is recursive. Let's
+compute `(FACT 3 ANSWER)`, where `ANSWER` is a continuation which is to
+receive the result of `FACT` applied to `3`; that is, that last thing
+`FACT` should do is apply the continuation `ANSWER` to its result.
+
+....
+    =>   (FACT 3 ANSWER)
+    =>   (IF (= 3 0) (ANSWER 1)
+                 (FACT (- 3 1) (LAMBDA (A) (ANSWER (* 3 A)))))
+    =>   (FACT (- 3 1) (LAMBDA (A) (ANSWER (* 3 A))))
+    =>   (FACT 2 (LAMBDA (A) (ANSWER (* 3 A))))
+    =>   (IF (= 2 0) ((LAMBDA (A) (ANSWER (* 3 A))) 1)
+                 (FACT (- 2 1)
+                       (LAMBDA (A)
+                               ((LAMBDA (A) (ANSWER (* 3 A)))
+                                (* 2 A)))))
+    =>   (FACT (- 2 1)
+                   (LAMBDA (A)
+                           ((LAMBDA (A) (ANSWER (* 3 A)))
+                            (* 2 A))))
+    =>   (FACT 1
+                   (LAMBDA (A)
+                           ((LAMBDA (A) (ANSWER (* 3 A)))
+                            (* 2 A))))
+    =>   (IF (= 1 0)
+                 ((LAMBDA (A) 
+                          ((LAMBDA (A) (ANSWER (* 3 A)))
+                           (* 2 A)))
+                  1)
+                 (FACT (- 1 1)
+                       (LAMBDA (A)
+                               ((LAMBDA (A)
+                                        ((LAMBDA (A)
+                                                 (ANSWER (* 3 A)))
+                                         (* 2 A)))
+                                (* 1 A)))))
+    =>   (FACT (- 1 1)
+                   (LAMBDA (A)
+                           ((LAMBDA (A)
+                                    ((LAMBDA (A)
+                                             (ANSWER (* 3 A)))
+                                     (* 2 A)))
+                             (* 1 A))))
+    =>   (FACT 0
+                  (LAMBDA (A)
+                          ((LAMBDA (A)
+                                   ((LAMBDA (A)
+                                            (ANSWER (* 3 A)))
+                                    (* 2 A)))
+                           (* 1 A))))
+    =>   (IF (= 0 0)
+                 ((LAMBDA (A)
+                          ((LAMBDA (A)
+                                   ((LAMBDA (A)
+                                            (ANSWER (* 3 A)))A
+                                    (* 2 A)))
+                           (* 1 A)))
+                   1)
+                  (FACT (- 0 1)
+                        (LAMBDA (A)
+                                ((LAMBDA (A)
+                                         ((LAMBDA (A)
+                                                  ((LAMBDA (A)
+                                                           (ANSWER (* 3 A)))
+                                                   (* 2 A)))
+                                          (* 1 A)))
+                                 (* 0 A)))))
+    =>   ((LAMBDA (A)
+              ((LAMBDA (A)
+                       ((LAMBDA (A)
+                                (ANSWER (* 3 A)))
+                        (* 2 A)))
+               (* 1 A)))
+             1)
+    =>   ((LAMBDA (A)
+                      ((LAMBDA (A)
+                               (ANSWER (* 3 A)))
+                       (* 2 A)))
+             (* 1 1))
+    =>   ((LAMBDA (A)
+                      ((LAMBDA (A)
+                               (ANSWER (* 3 A)))
+                       (* 2 A)))
+             1)
+    =>   ((LAMBDA (A)
+                     (ANSWER (* 3 A)))
+             (* 2 1))
+    =>   ((LAMBDA (A)
+                     (ANSWER (* 3 A)))
+             2)
+    =>   (ANSWER (* 3 2))
+    =>   (ANSWER 6)      WHEW!
+....
+
+Note that we have computed the factorial of 3 (and are about to give
+this result to the continuation), but in the process no combination with
+`FACT` in the first position has ever been reduced except as the
+outermost expression. If we think of the computation in terms of
+evaluation rather than substitution, this means that _we never returned
+a value from any application of the function `FACT`_! It is always
+possible, if we are willing to specify explicitly what to do with the
+answer, to perform any calculation in this way: rather than reducing to
+its value (cf. [Fisher]). That is, in this continuation-passing
+programming style, _a function always "returns" its result by "sending"
+it to another function_. This is the key idea.
+
+We also note that by our previous observation, this program is
+essentially recursive in that the expressions produced as intermediate
+results of the substitution semantics grow to a size proportional to the
+depth. In fact, the same information is being stored in the nested
+continuations produced by this program as in the nested products
+produced by the traditional recursion — what to do with the result.
+
+One might object that this `FACT` is not the same kind of object as the
+previous definition, since we can't use it as a function in the same
+manner. Note however, that if we supply the continuation
+`(LAMBDA (X) X)`, the resulting combination `(FACT 3 (LAMBDA (X) X))`
+will reduce to `6`, just as with traditional recursion.
+
+One might also object that we are using function values — the primitives
+`=`, `-` and `*` are functions which return values, for example. But
+this is just a property of the primitives; consider a new set of
+primitives `==`, `--` and `**` which accept continuations (indeed, let
+`==` take two continuations: if the predicate is `TRUE` call the first,
+otherwise call the second). We can define `FACT` as follows:
+
+....
+    (DEFINE FACT
+       (LAMBDA (N C)
+           (== N 0
+               (LAMBDA () (C 1))
+               (LAMBDA ()
+                   (-- N 1
+                       (LAMBDA (M)
+                           (FACT M (LAMBDA (A) (** A N C)))))))))
+....
+
+We can see here that no functional application returns value in a
+computation of factorial in this situation. We believe that functional
+usage, where applicable (pun intended), is more perspisuous than
+continuation-passing. We shall therefore use functional primitives such
+as `*` rather than `**` whereever possible, keeping in mind the we could
+use `**` instead if we wished.
+
+=== Section 4: Some Implementation Issues
+
+The key problem is _efficiency_. Although it is easy to build an
+inefficient interpreter which straightforwardly performs expression
+substitutions; such an interpreter performs much unnecessary copying of
+intermediate expressions. The standard solution to this problem is to
+use an auxiliary structure, called the _environment_, which represents a
+set of _virtual substitutions_. Thus, when evaluating an expression of
+the form
+
+....
+    ((LAMBDA <vars> <body>) <args>) in environment E
+            
+....
+
+instead of reducing it by performing
+
+....
+    Subst[<args> <vars> <body>]
+            
+....
+
+we reduce to
+
+....
+    <body> in environment E'=Pairlis[<vars> <args>* E]
+            
+....
+
+where _pairlis_ creates a new environment E' in which the <vars> are
+logically paired with (i.e. "bound to") the corresponding <args>* (the
+precise meaning of <args>* will be explained presently), and in which
+any variables not in <vars> are bound as they were in E.
+
+When using environments, it is necessary to keep them straight. For
+example, the following expression should manage to evaluate to 7:
+
+....
+    (((LAMBDA (X) (LAMBDA (Y) (+ X Y))) 3) 4)
+            
+....
+
+A substitution interpreter would cause the free occurence of `x` in the
+inner lambda expression to be replaced by 3 before applying that lambda
+expression to 4. An interpreter which uses environments must arrange for
+the expression `(+ x y)` to be evaluated in an environment such that `x`
+is bound to 3 and `y` is bound to 4. This implies that when the inner
+lambda expression is applied to 4, there must be associated with it an
+environment in which `x` is bound to 3. In order to solve this problem
+we introduce the notion of a _closure_ [McCarthy][Moses] which is a data
+structure containing a lambda expression, and an environment to be used
+when that lambda expression is applied to arguments. We will notate a
+closure using the _beta_ construct (our own notation, but isomorphic to
+the LISP _funarg_ construct) as follows:
